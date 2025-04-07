@@ -15,6 +15,7 @@ This tool backups your digikam database and the pictures it contains. This tool 
 * SSD_DEVICE
 * SSD_MOUNT_POINT
 * SOURCE DIRECTORIES
+  
 By changing these variables and running the script you will be able to backup everything to the ssd. Note that the auto mounting for some reason does not work, it will dismount the ssd by itself.
 
 2. RAWtoJPGSync
