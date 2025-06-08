@@ -1,178 +1,196 @@
 #!/usr/bin/env python3
-
 import subprocess
-import os
 import sys
+import os
+import json
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import PathCompleter
 
-def check_command_exists(command):
-    """Check if a command exists."""
-    return subprocess.call(['which', command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
-
-def list_block_devices():
-    """List external block devices using lsblk."""
+def list_partitions():
     try:
-        result = subprocess.run(["lsblk", "-o", "NAME,SIZE,MOUNTPOINT,MODEL"], capture_output=True, text=True)
-        return result.stdout.strip()
-    except Exception as e:
-        print(f"Error listing devices: {e}")
+        result = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,SIZE,MOUNTPOINT,MODEL,TYPE"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to run lsblk: {e}")
         sys.exit(1)
 
-def select_block_device():
-    """Prompt the user to select a block device."""
-    output = list_block_devices()
-    lines = output.splitlines()
-    devices = []
-    print("\nAvailable external devices:\n")
-    for idx, line in enumerate(lines[1:], start=0):  # Skip header
-        print(f"{idx}: {line}")
-        devices.append(line)
+    data = result.stdout
+    blkinfo = json.loads(data)
+    partitions = []
 
+    def parse_blockdevices(devices):
+        for dev in devices:
+            if dev["type"] == "part":
+                partitions.append((
+                    dev["name"],
+                    dev.get("size", ""),
+                    dev.get("mountpoint") or "",
+                    dev.get("model") or "",
+                ))
+            if "children" in dev:
+                parse_blockdevices(dev["children"])
+
+    parse_blockdevices(blkinfo["blockdevices"])
+    return partitions
+
+def select_partition():
+    partitions = list_partitions()
+    if not partitions:
+        print("No partitions found.")
+        sys.exit(1)
+
+    print("\nAvailable partitions:\n")
+    for i, (name, size, mount, model) in enumerate(partitions):
+        print(f"{i}: /dev/{name} Size: {size} Mounted: {mount or '-'} Model: {model or '-'}")
     print("\nq: Cancel and exit")
+
     while True:
-        choice = input("Select the device number you want to use: ")
+        choice = input("Select the partition number you want to use: ").strip()
         if choice.lower() == 'q':
             print("Exiting.")
             sys.exit(0)
         try:
-            index = int(choice)
-            if 0 <= index < len(devices):
-                dev_line = devices[index]
-                dev_name = dev_line.split()[0]
-                return f"/dev/{dev_name}"
+            idx = int(choice)
+            if 0 <= idx < len(partitions):
+                return f"/dev/{partitions[idx][0]}"
             else:
-                print("Invalid index.")
+                print("Invalid number. Try again.")
         except ValueError:
             print("Please enter a valid number.")
 
-def get_mount_point(device):
-    """Check if the device is already mounted."""
-    try:
-        result = subprocess.run(["lsblk", "-o", "NAME,MOUNTPOINT", "-nr"], capture_output=True, text=True)
-        lines = result.stdout.strip().splitlines()
-        for line in lines:
-            parts = line.split()
-            if parts[0] in device:
-                return parts[1] if len(parts) > 1 else None
-    except Exception as e:
-        print(f"Error getting mount point: {e}")
-    return None
-
 def mount_device(device):
-    """Attempt to mount the selected device."""
+    device_name = os.path.basename(device)
+
+    # Get mount info from lsblk
     try:
-        mount_point = "/mnt/" + os.path.basename(device)
-        os.makedirs(mount_point, exist_ok=True)
-        subprocess.run(["sudo", "mount", device, mount_point], check=True)
-        return mount_point
-    except subprocess.CalledProcessError:
-        print("❌ Failed to mount the device.")
+        result = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,MOUNTPOINT"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        blkinfo = json.loads(result.stdout)
+    except Exception as e:
+        print(f"Failed to check lsblk info: {e}")
         sys.exit(1)
 
-def list_dirs(base_path):
-    try:
-        return [d for d in os.listdir(base_path)
-                if os.path.isdir(os.path.join(base_path, d))]
-    except Exception as e:
-        print(f"Error reading {base_path}: {e}")
-        return []
+    def find_mount(devices):
+        for dev in devices:
+            if f"/dev/{dev['name']}" == device:
+                return dev.get("mountpoint")
+            if "children" in dev:
+                mp = find_mount(dev["children"])
+                if mp:
+                    return mp
+        return None
 
-def prompt_for_directory(prompt_text, base_path=os.path.expanduser("~/Pictures")):
-    dirs = list_dirs(base_path)
-    print(f"\n{prompt_text}")
-    for i, d in enumerate(dirs):
-        print(f"{i}: {d}")
-    print("c: Type a custom absolute path")
-    print("q: Quit")
+    mount_point = find_mount(blkinfo["blockdevices"])
 
-    while True:
-        choice = input("Select a folder by number, 'c' for custom path, or 'q' to quit: ")
-        if choice.lower() == 'q':
-            print("Exiting.")
-            sys.exit(0)
-        elif choice.lower() == 'c':
-            custom_path = input("Enter the full path to the folder: ")
-            if os.path.isdir(custom_path):
-                return os.path.abspath(custom_path)
-            else:
-                print("Invalid path. Try again.")
-        else:
-            try:
-                idx = int(choice)
-                selected = os.path.join(base_path, dirs[idx])
-                return os.path.abspath(selected)
-            except (ValueError, IndexError):
-                print("Invalid selection. Try again.")
-
-def check_source_dirs(source_dirs):
-    for dir_path in source_dirs:
-        if not os.path.isdir(dir_path):
-            print(f"Error: Source directory '{dir_path}' does not exist.")
+    if mount_point:
+        print(f"✅ Device {device} is already mounted at {mount_point}")
+        return mount_point
+    else:
+        mount_point = f"/mnt/{device_name}"
+        try:
+            print(f"🛠 Creating mount point {mount_point} (requires sudo)...")
+            subprocess.run(["sudo", "mkdir", "-p", mount_point], check=True)
+            print(f"🛠 Mounting device {device} at {mount_point} (requires sudo)...")
+            subprocess.run(["sudo", "mount", device, mount_point], check=True)
+            print(f"✅ Mounted {device} at {mount_point}")
+            return mount_point
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Failed to mount device: {e}")
             sys.exit(1)
 
-def check_disk_usage(path):
-    subprocess.run(["df", "-h", path])
-    subprocess.run(["du", "-sh", path])
+def unmount_device(mount_point):
+    try:
+        print(f"🛠 Unmounting {mount_point} (requires sudo)...")
+        subprocess.run(["sudo", "umount", mount_point], check=True)
+        print(f"✅ Unmounted {mount_point}")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to unmount {mount_point}: {e}")
 
-def run_backup(source_dirs, dest):
+def select_source_directories():
+    print("\nPlease enter the full paths of the source directories to back up.")
+    print("Enter one directory at a time, use Tab to autocomplete.")
+    print("Press Enter on an empty line to finish.\n")
+
+    path_completer = PathCompleter(only_directories=True, expanduser=True)
+    selected_dirs = []
+
+    while True:
+        user_input = prompt("Source directory (empty to finish): ", completer=path_completer).strip()
+        if not user_input:
+            if selected_dirs:
+                break
+            else:
+                print("Please enter at least one directory.")
+                continue
+
+        expanded = os.path.abspath(os.path.expanduser(user_input))
+        if not os.path.isdir(expanded):
+            print(f"'{expanded}' is not a valid directory. Try again.")
+            continue
+
+        if expanded in selected_dirs:
+            print("Directory already added. Choose another or press Enter to finish.")
+            continue
+
+        selected_dirs.append(expanded)
+        print(f"Added: {expanded}")
+
+    return selected_dirs
+
+def ask_delete_option():
+    print("\n🧩 Do you want to enable mirror mode?")
+    print("This will DELETE files from the backup if they no longer exist in the source.")
+    print("Useful for syncing exactly, but unsafe if you want an archive.\n")
+    while True:
+        choice = input("Mirror deletions with --delete? (y/N): ").strip().lower()
+        if choice in ('y', 'n', ''):
+            return choice == 'y'
+        else:
+            print("Please enter 'y' or 'n'.")
+
+def run_backup(source_dirs, dest, use_delete):
     command = [
         "sudo", "rsync", "-aAXvh", "--progress", "--checksum",
         "--no-owner", "--no-group"
-    ] + source_dirs + [dest]
-    result = subprocess.run(command)
-    if result.returncode == 0:
+    ]
+    if use_delete:
+        command.append("--delete")
+
+    command += source_dirs + [dest]
+
+    print(f"\n🛰 Running rsync {'with --delete (mirror mode)' if use_delete else '(archive mode)'}...\n")
+    try:
+        subprocess.run(command, check=True)
         print("✅ Backup completed successfully!")
-    else:
-        print("❌ Backup failed.")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Backup failed: {e}")
         sys.exit(1)
 
-def unmount_device(mount_point):
-    choice = input("Do you want to unmount the SSD now? (y/n): ").lower()
-    if choice == 'y':
-        result = subprocess.run(["sudo", "umount", mount_point])
-        if result.returncode == 0:
-            print("✅ Unmounted successfully.")
-        else:
-            print("❌ Failed to unmount. Please do it manually.")
+def check_disk_usage(mount_point):
+    print(f"\nDisk usage for {mount_point}:")
+    subprocess.run(["df", "-h", mount_point])
 
 def main():
-    # 1. Check rsync
-    if not check_command_exists("rsync"):
-        print("rsync is not installed. Please install it and try again.")
-        sys.exit(1)
+    print("=== Backup External SSD Tool ===")
 
-    # 2. Select source directories
-    print("\n📁 Select the folders to back up:")
-    camera_dir = prompt_for_directory("Select your 📷 Camera photo folder")
-    digikam_dir = prompt_for_directory("Select your 📚 Digikam database folder")
-    source_dirs = [camera_dir, digikam_dir]
-    check_source_dirs(source_dirs)
-
-    # 3. Select device
-    print("\n💽 Select the external storage device:")
-    device = select_block_device()
-    mount_point = get_mount_point(device)
-
-    if mount_point:
-        print(f"🔌 Device is already mounted at {mount_point}")
-    else:
-        print(f"🛠 Mounting device {device}...")
-        mount_point = mount_device(device)
-
-    # 4. Disk usage before
-    print("\n📊 Disk usage before backup:")
+    device = select_partition()
+    mount_point = mount_device(device)
     check_disk_usage(mount_point)
 
-    # 5. Run rsync backup
-    print("\n🚀 Starting backup...")
-    run_backup(source_dirs, mount_point)
+    source_dirs = select_source_directories()
+    use_delete = ask_delete_option()
+    run_backup(source_dirs, mount_point, use_delete)
 
-    # 6. Disk usage after
-    print("\n📊 Disk usage after backup:")
     check_disk_usage(mount_point)
-
-    # 7. Optionally unmount
     unmount_device(mount_point)
 
 if __name__ == "__main__":
     main()
-
